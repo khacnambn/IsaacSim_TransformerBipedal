@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IsaacLab logs & outputs
+logs/
+logs_*/
+outputs/
+*.log
+
+# TensorBoard
+events.out.tfevents.*
+
+# Model checkpoints (keep only best)
+*.pt
+!*_best.pt
+*.pth
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Large USD files (optional - nếu quá lớn thì uncomment)
+# *.usd
