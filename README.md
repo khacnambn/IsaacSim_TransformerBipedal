@@ -2,6 +2,21 @@
 URDF folder: Transfomer_nam, SimpleTrans, Namtransformer, Bullettransformer, 3DOFTrans, Transformer_IsaacLab
 IsaacSim training: transformer_nam
 
+# Create project
+
+Run through ~/IsaacLab python.sh not python only 
+
+Build project:
+Create project (IsaacLab)
+ ./isaaclab.sh --new
+
+Build: 
+~/IsaacLab/isaac-sim/python.sh -m pip install -e source/Transform_process
+
+Check:
+~/IsaacLab/isaac-sim/python.sh scripts/list_envs.py
+
+
 # Training
 
 Install IsaacSim & IssacLab 
