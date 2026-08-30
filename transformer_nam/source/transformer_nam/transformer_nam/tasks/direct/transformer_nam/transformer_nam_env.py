@@ -8,7 +8,7 @@ from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg, ImuCfg, Imu
 from isaaclab.sim import SimulationCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 from isaaclab.utils.math import sample_uniform
 from isaaclab.utils.noise import GaussianNoiseCfg, gaussian_noise
 from isaaclab.sim.spawners import RigidBodyMaterialCfg
@@ -16,6 +16,8 @@ from isaaclab.sim.utils import bind_physics_material
 from random import uniform
 
 from .transformer_config import TRANSFORMER_CFG
+
+from ._lab3_compat import as_torch, imu_quat_w
 
 
 @configclass
@@ -53,7 +55,7 @@ class TransformerWalkEnvCfg(DirectRLEnvCfg):
     obj = "walk"
     
     weights = {
-        "walk": [1, 1, 1, 0, 2, 1, 1],
+        "walk": [1, 1, 1, 0, 2, 1.2, 1],
     }
     
     actuator_delay_max = 6
@@ -94,6 +96,21 @@ class TransformerWalkEnvCfg(DirectRLEnvCfg):
         update_period=0.012,
     )
 
+    domain_rand: bool = True
+
+    imu_bias_range: dict = {
+        "roll":  [-0.10, 0.15],         # Real range: ±0.1 rad
+        "pitch": [-0.42, -0.12],        # ← EXPAND! Real chạy từ -0.42 đến -0.12
+        "yaw":   [-0.03, 0.03],
+    }
+
+    # ✅ FIX: Giảm orientation noise (hiện tại quá nhỏ so với real)
+    imu_noise_std: dict = {
+        "orientation": 0.04,            # Tăng từ 0.015 → match real std
+        "angular_velocity": 0.15,       # Tăng từ 0.038 → match real GX std (0.3)
+    }
+
+    imu_drift_rate: float = 0.0001
 
 class TransformerWalkEnv(DirectRLEnv):
     """Direct RL environment for Transformer (6 DOF)"""
@@ -109,10 +126,9 @@ class TransformerWalkEnv(DirectRLEnv):
         ).repeat(self.num_envs, 1)
         self.obj = self.cfg.obj
         
-        # ✅ CHANGED: servo min/max for 6 joints only!
         # [Hip_L, Hip_R, Knee_L, Knee_R, Ankle_L, Ankle_R]
         self.servo_max = torch.tensor(
-            [30, 30, -45, -45, 30, 30],  # ✅ No Bub!
+            [30, 30, -45, -45, 30, 30],  
             device=self.device, dtype=torch.int
         )
         self.servo_min = torch.tensor(
@@ -120,9 +136,8 @@ class TransformerWalkEnv(DirectRLEnv):
             device=self.device, dtype=torch.int
         )
         
-        # ✅ CHANGED: base_pose for 6 joints
         # [Hip_L, Hip_R, Knee_L, Knee_R, Ankle_L, Ankle_R]
-        start_pos = [25, 25, -50, -50, 25, 25]  # ✅ No Bub!
+        start_pos = [25, 25, -50, -50, 25, 25]  
         self.base_pose = torch.tensor(
             [start_pos for _ in range(self.num_envs)], 
             device=self.device, dtype=torch.float32
@@ -160,6 +175,13 @@ class TransformerWalkEnv(DirectRLEnv):
             -1, 1
         )
         
+        # Thêm buffer cho IMU bias (random mỗi episode)
+        self.imu_bias = torch.zeros((self.num_envs, 3), device=self.device)  # roll, pitch, yaw
+        self.gyro_drift = torch.zeros((self.num_envs, 3), device=self.device)
+
+        # Flag để random bias khi reset
+        self._should_randomize_imu = self.cfg.domain_rand if hasattr(self.cfg, 'domain_rand') else False
+
         print(f"\n{'='*70}")
         print(f"🤖 TRANSFORMER ENV (6 DOF - NO BUB)")
         print(f"  Observation dim: {self.cfg.num_observations} (20 IMU + 24 action history)")
@@ -188,8 +210,8 @@ class TransformerWalkEnv(DirectRLEnv):
 
         from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
         ground_cfg = RigidBodyMaterialCfg(
-            static_friction=0.8,
-            dynamic_friction=0.4,
+            static_friction=2.0,
+            dynamic_friction=2.5,
             restitution=0.05,
             friction_combine_mode="average",
         )
@@ -199,13 +221,32 @@ class TransformerWalkEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
     
     def _get_observations(self) -> dict:
-        """✅ CHANGED: 44D observations (20 IMU + 24 action history for 6 joints)"""
         self.imu_data = self.scene.sensors["imu"].data
-        orient = quaternion_to_euler(self.imu_data.quat_w)
-        angular_vel = self.imu_data.ang_vel_b
-        
-        orient = gaussian_noise(orient, self.orient_noise)
-        angular_vel = gaussian_noise(angular_vel, self.gyro_noise)
+        orient_raw = quaternion_to_euler(imu_quat_w(self.robot, self.cfg.imu))     # raw từ sim
+        angular_vel_raw = self.imu_data.ang_vel_b
+
+        # 1. Áp dụng bias randomized (giống thực tế)
+        if self._should_randomize_imu:
+            orient = orient_raw + self.imu_bias
+        else:
+            # Nếu không random, dùng bias cố định trung bình từ real
+            fixed_bias = torch.tensor([0.0, -0.193, 0.0], device=self.device)
+            orient = orient_raw + fixed_bias
+
+        # 2. Áp dụng noise Gaussian (giống thực tế)
+        orient_noise = gaussian_noise(orient, GaussianNoiseCfg(mean=0.0, std=self.cfg.imu_noise_std["orientation"]))
+        gyro_noise_base = gaussian_noise(angular_vel_raw, GaussianNoiseCfg(mean=0.0, std=self.cfg.imu_noise_std["angular_velocity"]))
+
+        # GY (pitch rate) noise lớn hơn khi có motion (từ data real GY std cao)
+        gyro_noise = gyro_noise_base
+
+        orient += orient_noise
+        angular_vel = angular_vel_raw + gyro_noise
+
+        # 3. Thêm drift chậm (low-frequency bias change)
+        dt = 0.005  # simulation dt
+        self.gyro_drift += self.cfg.imu_drift_rate * torch.randn_like(self.gyro_drift) * dt
+        angular_vel += self.gyro_drift
         
         orient = scale_value(orient, -1.0, 1.0)
         angular_vel = scale_value(angular_vel, -2.0, 2.0)
@@ -272,11 +313,11 @@ class TransformerWalkEnv(DirectRLEnv):
     
     def _get_rewards(self) -> torch.Tensor:
         """Reward calculation"""
-        euler_imu_orient = quaternion_to_euler(self.imu_data.quat_w)
-        robot_root_pos = self.robot.data.root_pos_w
-        lin_vel = self.robot.data.root_com_vel_w
-        contact_pos = self.scene.sensors["contact"].data.pos_w
-        air_time = self.scene.sensors["contact"].data.current_air_time
+        euler_imu_orient = quaternion_to_euler(imu_quat_w(self.robot, self.cfg.imu))
+        robot_root_pos = as_torch(self.robot.data.root_pos_w)
+        lin_vel = as_torch(self.robot.data.root_com_vel_w)
+        contact_pos = as_torch(self.scene.sensors["contact"].data.pos_w)
+        air_time = as_torch(self.scene.sensors["contact"].data.current_air_time)
         
         orientation_rew = orientation_reward(euler_imu_orient, self.obj, self.device)
         height_rew = height_reward(robot_root_pos)  # ✅ Fixed ideal_height inside function
@@ -318,10 +359,10 @@ class TransformerWalkEnv(DirectRLEnv):
         
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         
-        head_heights = self.robot.data.root_pos_w[:, 2]
+        head_heights = as_torch(self.robot.data.root_pos_w)[:, 2]
         height_termination = head_heights < 0.1
         
-        root_orientations = self.robot.data.root_quat_w
+        root_orientations = as_torch(self.robot.data.root_quat_w)
         euler_angles = quaternion_to_euler(root_orientations)
         x_rotation = torch.abs(euler_angles[:, 0])
         y_rotation = torch.abs(euler_angles[:, 1])
@@ -337,12 +378,32 @@ class TransformerWalkEnv(DirectRLEnv):
             env_ids = self.robot._ALL_INDICES
         
         super()._reset_idx(env_ids)
-        
-        root_state = self.robot.data.default_root_state[env_ids]
+
+        if self._should_randomize_imu:
+            # Random bias mới cho các env được reset
+            n = len(env_ids)
+            
+            self.imu_bias[env_ids, 0] = sample_uniform(
+                self.cfg.imu_bias_range["roll"][0],
+                self.cfg.imu_bias_range["roll"][1],
+                (n,), device=self.device
+            )
+            self.imu_bias[env_ids, 1] = sample_uniform(
+                self.cfg.imu_bias_range["pitch"][0],
+                self.cfg.imu_bias_range["pitch"][1],
+                (n,), device=self.device
+            )
+            self.imu_bias[env_ids, 2] = sample_uniform(
+                self.cfg.imu_bias_range["yaw"][0],
+                self.cfg.imu_bias_range["yaw"][1],
+                (n,), device=self.device
+            )
+
+        root_state = as_torch(self.robot.data.default_root_state)[env_ids]
         root_state[:, :3] += self.scene.env_origins[env_ids]
         
-        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
-        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        joint_pos = as_torch(self.robot.data.default_joint_pos)[env_ids].clone()
+        joint_vel = as_torch(self.robot.data.default_joint_vel)[env_ids].clone()
         
         reset_ids = env_ids.flatten().long()
         n_reset = reset_ids.shape[0]
@@ -390,7 +451,9 @@ def quaternion_to_euler(quat: torch.Tensor):
     
     quat = quat / torch.norm(quat, dim=-1, keepdim=True)
     
-    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    # IsaacLab 3.0 tra quaternion theo (x, y, z, w), khong con (w, x, y, z)
+    
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
     
     sinr_cosp = 2 * (w * x + y * z)
     cosr_cosp = 1 - 2 * (x * x + y * y)
